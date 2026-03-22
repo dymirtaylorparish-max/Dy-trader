@@ -10,26 +10,33 @@ app.get("/", (_req, res) => {
 
 function calcEMA(values, period) {
   if (!values.length) return 0;
+
   const k = 2 / (period + 1);
   let ema = values[0];
+
   for (let i = 1; i < values.length; i++) {
     ema = values[i] * k + ema * (1 - k);
   }
+
   return Number(ema.toFixed(2));
 }
 
 function calcVWAP(highs, lows, closes, volumes) {
+  if (!closes.length) return 0;
+
   let cumulativePV = 0;
   let cumulativeVolume = 0;
 
   for (let i = 0; i < closes.length; i++) {
     const typicalPrice = (highs[i] + lows[i] + closes[i]) / 3;
     const volume = volumes[i] || 1;
+
     cumulativePV += typicalPrice * volume;
     cumulativeVolume += volume;
   }
 
   if (!cumulativeVolume) return Number(closes[closes.length - 1] || 0);
+
   return Number((cumulativePV / cumulativeVolume).toFixed(2));
 }
 
@@ -74,14 +81,37 @@ app.get("/api/futures", async (req, res) => {
       });
     }
 
-    const closes = (quote.close || []).filter((v) => typeof v === "number");
-    const highs = (quote.high || []).filter((v) => typeof v === "number");
-    const lows = (quote.low || []).filter((v) => typeof v === "number");
-    const volumes = (quote.volume || []).map((v) => (typeof v === "number" ? v : 1));
+    const closes = [];
+    const highs = [];
+    const lows = [];
+    const volumes = [];
 
-    const latestPrice =
-      closes.length > 0 ? Number(closes[closes.length - 1].toFixed(2)) : Number(meta.regularMarketPrice || 0);
+    for (let i = 0; i < (quote.close?.length || 0); i++) {
+      const c = quote.close[i];
+      const h = quote.high?.[i];
+      const l = quote.low?.[i];
+      const v = quote.volume?.[i];
 
+      if (
+        typeof c === "number" &&
+        typeof h === "number" &&
+        typeof l === "number"
+      ) {
+        closes.push(c);
+        highs.push(h);
+        lows.push(l);
+        volumes.push(typeof v === "number" ? v : 1);
+      }
+    }
+
+    if (!closes.length) {
+      return res.status(500).json({
+        error: "Failed to fetch live data",
+        details: "No valid candles returned"
+      });
+    }
+
+    const latestPrice = Number(closes[closes.length - 1].toFixed(2));
     const ema9 = calcEMA(closes, 9);
     const ema21 = calcEMA(closes, 21);
     const vwap = calcVWAP(highs, lows, closes, volumes);
