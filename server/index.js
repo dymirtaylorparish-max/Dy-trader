@@ -54,11 +54,11 @@ async function fetchFromTwelve(symbol) {
   }
 
 const map = {
-  NQ: "NQ=F",
-  ES: "ES=F",
-  CL: "CL=F",
-  GC: "GC=F",
-  BTC: "BTC-USD"
+  NQ: "NASDAQ100",
+  ES: "SPX",
+  CL: "WTI",
+  GC: "XAU/USD",
+  BTC: "BTC/USD"
 };
 
   const twelveSymbol = map[symbol];
