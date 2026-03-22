@@ -1,6 +1,5 @@
 import express from "express";
 import cors from "cors";
-import * as yahooFinance from "yahoo-finance2";
 
 const app = express();
 app.use(cors());
@@ -26,25 +25,46 @@ app.get("/api/futures", async (req, res) => {
       return res.status(400).json({ error: "Unsupported symbol" });
     }
 
-    const quote = await yahooFinance.default.quote(yahooSymbol);
+    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(
+      yahooSymbol
+    )}?interval=1m&range=1d`;
 
-const price = Number(quote?.regularMarketPrice || 0);
-const prevClose = Number(quote?.regularMarketPreviousClose || price);
+    const response = await fetch(url);
+    const json = await response.json();
 
-const signal =
-  price > prevClose ? "BUY" :
-  price < prevClose ? "SELL" :
-  "NONE";
-    res.json({
+    const result = json?.chart?.result?.[0];
+    const meta = result?.meta;
+    const quote = result?.indicators?.quote?.[0];
+
+    if (!result || !meta || !quote) {
+      return res.status(500).json({
+        error: "Failed to fetch live data",
+        details: "Invalid Yahoo response"
+      });
+    }
+
+    const closes = (quote.close || []).filter((v) => typeof v === "number");
+    const latestClose =
+      closes.length > 0 ? closes[closes.length - 1] : meta.regularMarketPrice || 0;
+
+    const prevClose = Number(meta.previousClose || latestClose);
+    const price = Number(latestClose || 0);
+
+    const signal =
+      price > prevClose ? "BUY" :
+      price < prevClose ? "SELL" :
+      "NONE";
+
+    return res.json({
       symbol,
       price,
       ema: price,
       vwap: price,
       signal,
-      provider: "yahoo-quote"
+      provider: "yahoo-chart-api"
     });
   } catch (error) {
-    res.status(500).json({
+    return res.status(500).json({
       error: "Failed to fetch live data",
       details: error.message
     });
