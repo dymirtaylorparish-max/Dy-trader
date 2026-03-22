@@ -38,6 +38,30 @@ const SYMBOL_CONFIG = {
   },
 };
 
+const SESSION_RULES = {
+  Tokyo: {
+    minMovePct: 0.08,
+    emaSpreadFactor: 0.00012,
+    vwapDistanceFactor: 0.00008,
+    preferredSymbols: ["GC", "CL"],
+    label: "Tokyo",
+  },
+  London: {
+    minMovePct: 0.12,
+    emaSpreadFactor: 0.00018,
+    vwapDistanceFactor: 0.00012,
+    preferredSymbols: ["GC", "CL", "ES"],
+    label: "London",
+  },
+  "New York": {
+    minMovePct: 0.18,
+    emaSpreadFactor: 0.00022,
+    vwapDistanceFactor: 0.00016,
+    preferredSymbols: ["NQ", "ES", "CL", "GC"],
+    label: "New York",
+  },
+};
+
 const brokerState = {
   connected: false,
   mode: "DEMO",
@@ -72,20 +96,90 @@ function vwapFromCandles(candles) {
     const low = Number(c.low);
     const close = Number(c.close);
     const volume = Number(c.volume || 0);
-
     const typicalPrice = (high + low + close) / 3;
     pv += typicalPrice * volume;
     volumeTotal += volume;
   }
 
-  if (!volumeTotal) {
-    return Number(candles[candles.length - 1]?.close || 0);
-  }
-
+  if (!volumeTotal) return Number(candles[candles.length - 1]?.close || 0);
   return pv / volumeTotal;
 }
 
-function makeSimData(symbol) {
+function getVolatilityLabel(movePctAbs, sessionRule) {
+  if (movePctAbs >= sessionRule.minMovePct * 2.2) return "High";
+  if (movePctAbs >= sessionRule.minMovePct) return "Normal";
+  return "Low";
+}
+
+function getSessionRule(sessionName) {
+  return SESSION_RULES[sessionName] || SESSION_RULES["New York"];
+}
+
+function buildSessionLogic({
+  symbol,
+  price,
+  ema9,
+  ema21,
+  vwap,
+  movePct,
+  sessionName,
+}) {
+  const sessionRule = getSessionRule(sessionName);
+  const moveAbs = Math.abs(movePct);
+  const emaSpread = Math.abs(ema9 - ema21);
+  const vwapDistance = Math.abs(price - vwap);
+
+  const minEmaSpread = price * sessionRule.emaSpreadFactor;
+  const minVwapDistance = price * sessionRule.vwapDistanceFactor;
+  const preferred = sessionRule.preferredSymbols.includes(symbol);
+
+  let signal = "NO TRADE";
+  let bias = "Neutral";
+  let note = "No clean setup right now.";
+
+  const longTrend = ema9 > ema21 && price > vwap;
+  const shortTrend = ema9 < ema21 && price < vwap;
+  const enoughMove = moveAbs >= sessionRule.minMovePct;
+  const enoughStructure = emaSpread >= minEmaSpread && vwapDistance >= minVwapDistance;
+
+  if (longTrend) bias = "Bullish";
+  if (shortTrend) bias = "Bearish";
+
+  if (longTrend && enoughMove && enoughStructure) {
+    signal = preferred ? "BUY" : "NO TRADE";
+    note =
+      signal === "BUY"
+        ? `Momentum above VWAP, EMA trend bullish, and ${sessionName} thresholds passed.`
+        : `Bullish structure exists, but ${symbol} is not a priority contract for ${sessionName}.`;
+  } else if (shortTrend && enoughMove && enoughStructure) {
+    signal = preferred ? "SELL" : "NO TRADE";
+    note =
+      signal === "SELL"
+        ? `Momentum below VWAP, EMA trend bearish, and ${sessionName} thresholds passed.`
+        : `Bearish structure exists, but ${symbol} is not a priority contract for ${sessionName}.`;
+  } else if (moveAbs < sessionRule.minMovePct) {
+    note = `${sessionName} move is too small. Waiting for stronger expansion.`;
+  } else if (emaSpread < minEmaSpread) {
+    note = `${sessionName} EMA spread is too tight. Trend confirmation is weak.`;
+  } else if (vwapDistance < minVwapDistance) {
+    note = `${sessionName} price is too close to VWAP. No edge yet.`;
+  }
+
+  return {
+    signal,
+    bias,
+    note,
+    volatility: getVolatilityLabel(moveAbs, sessionRule),
+    preferred,
+    sessionThresholds: {
+      minMovePct: sessionRule.minMovePct,
+      minEmaSpread: roundTo(minEmaSpread, 4),
+      minVwapDistance: roundTo(minVwapDistance, 4),
+    },
+  };
+}
+
+function makeSimData(symbol, sessionName) {
   const config = SYMBOL_CONFIG[symbol];
   const variance = (Math.random() - 0.5) * 20;
 
@@ -116,9 +210,15 @@ function makeSimData(symbol) {
 
   const movePct = roundTo(((price - prevClose) / prevClose) * 100, 2);
 
-  let signal = "NO TRADE";
-  if (ema9 > ema21 && price > vwap) signal = "BUY";
-  if (ema9 < ema21 && price < vwap) signal = "SELL";
+  const sessionLogic = buildSessionLogic({
+    symbol,
+    price,
+    ema9,
+    ema21,
+    vwap,
+    movePct,
+    sessionName,
+  });
 
   return {
     symbol,
@@ -129,7 +229,15 @@ function makeSimData(symbol) {
     vwap,
     prevClose,
     movePct,
-    signal,
+    session: sessionName,
+    signal: sessionLogic.signal,
+    bias: sessionLogic.bias,
+    note: sessionLogic.note,
+    volatility: sessionLogic.volatility,
+    preferred: sessionLogic.preferred,
+    sessionThresholds: sessionLogic.sessionThresholds,
+    sessionHigh: roundTo(Math.max(price, ema9, ema21, vwap), 2),
+    sessionLow: roundTo(Math.min(price, ema9, ema21, vwap), 2),
     tickSize: config.tickSize,
     tickValue: config.tickValue,
     provider: "server-sim",
@@ -137,7 +245,7 @@ function makeSimData(symbol) {
   };
 }
 
-async function fetchYahooMarketData(symbol) {
+async function fetchYahooMarketData(symbol, sessionName) {
   const config = SYMBOL_CONFIG[symbol];
   const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(
     config.yahooSymbol
@@ -150,26 +258,20 @@ async function fetchYahooMarketData(symbol) {
     },
   });
 
-  if (!res.ok) {
-    throw new Error(`Yahoo HTTP ${res.status}`);
-  }
+  if (!res.ok) throw new Error(`Yahoo HTTP ${res.status}`);
 
   const json = await res.json();
   const result = json?.chart?.result?.[0];
   const quote = result?.indicators?.quote?.[0];
 
-  if (!result || !quote) {
-    throw new Error("Yahoo malformed response");
-  }
+  if (!result || !quote) throw new Error("Yahoo malformed response");
 
   const closes = (quote.close || []).filter((x) => typeof x === "number");
   const highs = quote.high || [];
   const lows = quote.low || [];
   const volumes = quote.volume || [];
 
-  if (!closes.length) {
-    throw new Error("No close data");
-  }
+  if (!closes.length) throw new Error("No close data");
 
   const candles = closes.map((close, i) => ({
     close,
@@ -188,10 +290,18 @@ async function fetchYahooMarketData(symbol) {
       : closes[0];
 
   const movePct = roundTo(((price - prevClose) / prevClose) * 100, 2);
+  const sessionHigh = roundTo(Math.max(...closes.slice(-30)), 2);
+  const sessionLow = roundTo(Math.min(...closes.slice(-30)), 2);
 
-  let signal = "NO TRADE";
-  if (ema9Value > ema21Value && price > vwapValue) signal = "BUY";
-  if (ema9Value < ema21Value && price < vwapValue) signal = "SELL";
+  const sessionLogic = buildSessionLogic({
+    symbol,
+    price,
+    ema9: ema9Value,
+    ema21: ema21Value,
+    vwap: vwapValue,
+    movePct,
+    sessionName,
+  });
 
   return {
     symbol,
@@ -202,7 +312,15 @@ async function fetchYahooMarketData(symbol) {
     vwap: roundTo(vwapValue, 2),
     prevClose: roundTo(prevClose, 2),
     movePct,
-    signal,
+    session: sessionName,
+    signal: sessionLogic.signal,
+    bias: sessionLogic.bias,
+    note: sessionLogic.note,
+    volatility: sessionLogic.volatility,
+    preferred: sessionLogic.preferred,
+    sessionThresholds: sessionLogic.sessionThresholds,
+    sessionHigh,
+    sessionLow,
     tickSize: config.tickSize,
     tickValue: config.tickValue,
     provider: "yahoo-chart",
@@ -210,13 +328,13 @@ async function fetchYahooMarketData(symbol) {
   };
 }
 
-async function getMarketData(symbol) {
+async function getMarketData(symbol, sessionName) {
   if (!SYMBOL_CONFIG[symbol]) return null;
 
   try {
-    return await fetchYahooMarketData(symbol);
+    return await fetchYahooMarketData(symbol, sessionName);
   } catch {
-    return makeSimData(symbol);
+    return makeSimData(symbol, sessionName);
   }
 }
 
@@ -226,7 +344,8 @@ app.get("/", (_req, res) => {
 
 app.get("/api/futures", async (req, res) => {
   const symbol = String(req.query.symbol || "NQ").toUpperCase();
-  const data = await getMarketData(symbol);
+  const session = String(req.query.session || "New York");
+  const data = await getMarketData(symbol, session);
 
   if (!data) {
     return res.status(400).json({
@@ -238,9 +357,10 @@ app.get("/api/futures", async (req, res) => {
   res.json(data);
 });
 
-app.get("/api/scanner", async (_req, res) => {
+app.get("/api/scanner", async (req, res) => {
+  const session = String(req.query.session || "New York");
   const results = await Promise.all(
-    Object.keys(SYMBOL_CONFIG).map((symbol) => getMarketData(symbol))
+    Object.keys(SYMBOL_CONFIG).map((symbol) => getMarketData(symbol, session))
   );
   res.json(results.filter(Boolean));
 });
@@ -250,13 +370,22 @@ app.get("/api/orders", (_req, res) => {
 });
 
 app.post("/api/orders", async (req, res) => {
-  const { symbol, side, qty, orderType, limitPrice, stopLoss, takeProfit } = req.body || {};
+  const {
+    symbol,
+    side,
+    qty,
+    orderType,
+    limitPrice,
+    stopLoss,
+    takeProfit,
+    session,
+  } = req.body || {};
 
   if (!SYMBOL_CONFIG[symbol]) {
     return res.status(400).json({ error: "Unsupported symbol" });
   }
 
-  const market = await getMarketData(symbol);
+  const market = await getMarketData(symbol, session || "New York");
   const now = new Date().toISOString();
 
   const order = {
@@ -272,6 +401,7 @@ app.post("/api/orders", async (req, res) => {
     fillPrice: market?.price ?? "",
     timestamp: now,
     mode: brokerState.mode,
+    session: session || "New York",
   };
 
   orders.unshift(order);
@@ -281,11 +411,12 @@ app.post("/api/orders", async (req, res) => {
     symbol,
     side,
     qty: Number(qty || 1),
-    entryPrice: market?.price ?? "",
-    currentPrice: market?.price ?? "",
+    entryPrice: Number(market?.price || 0),
+    currentPrice: Number(market?.price || 0),
     pnl: 0,
     timestamp: now,
     mode: brokerState.mode,
+    session: session || "New York",
   });
 
   res.json({ ok: true, order });
@@ -294,8 +425,8 @@ app.post("/api/orders", async (req, res) => {
 app.get("/api/positions", async (_req, res) => {
   const updated = await Promise.all(
     positions.map(async (p) => {
-      const market = await getMarketData(p.symbol);
-      const currentPrice = market?.price ?? p.currentPrice;
+      const market = await getMarketData(p.symbol, p.session || "New York");
+      const currentPrice = Number(market?.price ?? p.currentPrice);
       const multiplier = p.side === "BUY" ? 1 : -1;
       const pnl = roundTo((currentPrice - p.entryPrice) * p.qty * multiplier, 2);
 
