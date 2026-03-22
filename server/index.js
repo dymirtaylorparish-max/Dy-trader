@@ -7,35 +7,12 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 8080;
 
+// ================= CONFIG =================
 const SYMBOL_CONFIG = {
-  NQ: {
-    displayName: "Nasdaq Futures",
-    yahooSymbol: "NQ=F",
-    basePrice: 18250,
-    tickSize: 0.25,
-    tickValue: 5,
-  },
-  ES: {
-    displayName: "S&P 500 Futures",
-    yahooSymbol: "ES=F",
-    basePrice: 5285,
-    tickSize: 0.25,
-    tickValue: 12.5,
-  },
-  CL: {
-    displayName: "Crude Oil Futures",
-    yahooSymbol: "CL=F",
-    basePrice: 77.2,
-    tickSize: 0.01,
-    tickValue: 10,
-  },
-  GC: {
-    displayName: "Gold Futures",
-    yahooSymbol: "GC=F",
-    basePrice: 2337,
-    tickSize: 0.1,
-    tickValue: 10,
-  },
+  NQ: { displayName: "Nasdaq Futures", basePrice: 18250, tickSize: 0.25, tickValue: 5 },
+  ES: { displayName: "S&P 500 Futures", basePrice: 5285, tickSize: 0.25, tickValue: 12.5 },
+  CL: { displayName: "Crude Oil Futures", basePrice: 77.2, tickSize: 0.01, tickValue: 10 },
+  GC: { displayName: "Gold Futures", basePrice: 2337, tickSize: 0.1, tickValue: 10 },
 };
 
 const SESSION_RULES = {
@@ -44,24 +21,22 @@ const SESSION_RULES = {
     emaSpreadFactor: 0.00012,
     vwapDistanceFactor: 0.00008,
     preferredSymbols: ["GC", "CL"],
-    label: "Tokyo",
   },
   London: {
     minMovePct: 0.12,
     emaSpreadFactor: 0.00018,
     vwapDistanceFactor: 0.00012,
     preferredSymbols: ["GC", "CL", "ES"],
-    label: "London",
   },
   "New York": {
     minMovePct: 0.18,
     emaSpreadFactor: 0.00022,
     vwapDistanceFactor: 0.00016,
     preferredSymbols: ["NQ", "ES", "CL", "GC"],
-    label: "New York",
   },
 };
 
+// ================= STATE =================
 const brokerState = {
   connected: false,
   mode: "DEMO",
@@ -70,9 +45,22 @@ const brokerState = {
   accountLabel: "Not Connected",
 };
 
+const demoAccount = {
+  id: "DEMO1717497",
+  nickname: "Demo",
+  netLiquidity: 50000,
+  marginAvailable: 50000,
+  openPnl: 0,
+  realizedPnl: 0,
+  cashBalance: 50000,
+  canTrade: true,
+  permissions: ["futures", "sim"],
+};
+
 const orders = [];
 const positions = [];
 
+// ================= HELPERS =================
 function roundTo(value, decimals = 2) {
   return Number(value.toFixed(decimals));
 }
@@ -87,32 +75,47 @@ function ema(values, period) {
   return result;
 }
 
+function makeSimCandles(basePrice, symbol) {
+  const candles = [];
+  let price = basePrice;
+
+  for (let i = 0; i < 30; i += 1) {
+    const variance = symbol === "CL" ? (Math.random() - 0.5) * 0.8 : (Math.random() - 0.5) * 20;
+    const open = price;
+    const close = roundTo(open + variance, 2);
+    const high = roundTo(Math.max(open, close) + Math.abs(variance) * 0.3, 2);
+    const low = roundTo(Math.min(open, close) - Math.abs(variance) * 0.3, 2);
+    const volume = Math.floor(300 + Math.random() * 2000);
+
+    candles.push({ open, high, low, close, volume });
+    price = close;
+  }
+
+  return candles;
+}
+
 function vwapFromCandles(candles) {
   let pv = 0;
   let volumeTotal = 0;
 
   for (const c of candles) {
-    const high = Number(c.high);
-    const low = Number(c.low);
-    const close = Number(c.close);
-    const volume = Number(c.volume || 0);
-    const typicalPrice = (high + low + close) / 3;
-    pv += typicalPrice * volume;
-    volumeTotal += volume;
+    const typicalPrice = (c.high + c.low + c.close) / 3;
+    pv += typicalPrice * c.volume;
+    volumeTotal += c.volume;
   }
 
-  if (!volumeTotal) return Number(candles[candles.length - 1]?.close || 0);
+  if (!volumeTotal) return candles[candles.length - 1]?.close || 0;
   return pv / volumeTotal;
+}
+
+function getSessionRule(sessionName) {
+  return SESSION_RULES[sessionName] || SESSION_RULES["New York"];
 }
 
 function getVolatilityLabel(movePctAbs, sessionRule) {
   if (movePctAbs >= sessionRule.minMovePct * 2.2) return "High";
   if (movePctAbs >= sessionRule.minMovePct) return "Normal";
   return "Low";
-}
-
-function getSessionRule(sessionName) {
-  return SESSION_RULES[sessionName] || SESSION_RULES["New York"];
 }
 
 function buildSessionLogic({
@@ -171,129 +174,25 @@ function buildSessionLogic({
     note,
     volatility: getVolatilityLabel(moveAbs, sessionRule),
     preferred,
-    sessionThresholds: {
-      minMovePct: sessionRule.minMovePct,
-      minEmaSpread: roundTo(minEmaSpread, 4),
-      minVwapDistance: roundTo(minVwapDistance, 4),
-    },
   };
 }
 
-function makeSimData(symbol, sessionName) {
+function getMarketData(symbol, sessionName = "New York") {
   const config = SYMBOL_CONFIG[symbol];
-  const variance = (Math.random() - 0.5) * 20;
+  if (!config) return null;
 
-  const price =
-    symbol === "CL"
-      ? roundTo(config.basePrice + variance / 20, 2)
-      : roundTo(config.basePrice + variance, 2);
-
-  const ema9 =
-    symbol === "CL"
-      ? roundTo(price + (Math.random() - 0.5) * 0.3, 2)
-      : roundTo(price + (Math.random() - 0.5) * 6, 2);
-
-  const ema21 =
-    symbol === "CL"
-      ? roundTo(price + (Math.random() - 0.5) * 0.5, 2)
-      : roundTo(price + (Math.random() - 0.5) * 10, 2);
-
-  const vwap =
-    symbol === "CL"
-      ? roundTo(price + (Math.random() - 0.5) * 0.25, 2)
-      : roundTo(price + (Math.random() - 0.5) * 5, 2);
-
-  const prevClose =
-    symbol === "CL"
-      ? roundTo(price + (Math.random() - 0.5) * 0.8, 2)
-      : roundTo(price + (Math.random() - 0.5) * 18, 2);
-
-  const movePct = roundTo(((price - prevClose) / prevClose) * 100, 2);
-
-  const sessionLogic = buildSessionLogic({
-    symbol,
-    price,
-    ema9,
-    ema21,
-    vwap,
-    movePct,
-    sessionName,
-  });
-
-  return {
-    symbol,
-    displayName: config.displayName,
-    price,
-    ema9,
-    ema21,
-    vwap,
-    prevClose,
-    movePct,
-    session: sessionName,
-    signal: sessionLogic.signal,
-    bias: sessionLogic.bias,
-    note: sessionLogic.note,
-    volatility: sessionLogic.volatility,
-    preferred: sessionLogic.preferred,
-    sessionThresholds: sessionLogic.sessionThresholds,
-    sessionHigh: roundTo(Math.max(price, ema9, ema21, vwap), 2),
-    sessionLow: roundTo(Math.min(price, ema9, ema21, vwap), 2),
-    tickSize: config.tickSize,
-    tickValue: config.tickValue,
-    provider: "server-sim",
-    timestamp: new Date().toISOString(),
-  };
-}
-
-async function fetchYahooMarketData(symbol, sessionName) {
-  const config = SYMBOL_CONFIG[symbol];
-  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(
-    config.yahooSymbol
-  )}?interval=5m&range=1d`;
-
-  const res = await fetch(url, {
-    headers: {
-      "User-Agent": "Mozilla/5.0",
-      Accept: "application/json",
-    },
-  });
-
-  if (!res.ok) throw new Error(`Yahoo HTTP ${res.status}`);
-
-  const json = await res.json();
-  const result = json?.chart?.result?.[0];
-  const quote = result?.indicators?.quote?.[0];
-
-  if (!result || !quote) throw new Error("Yahoo malformed response");
-
-  const closes = (quote.close || []).filter((x) => typeof x === "number");
-  const highs = quote.high || [];
-  const lows = quote.low || [];
-  const volumes = quote.volume || [];
-
-  if (!closes.length) throw new Error("No close data");
-
-  const candles = closes.map((close, i) => ({
-    close,
-    high: typeof highs[i] === "number" ? highs[i] : close,
-    low: typeof lows[i] === "number" ? lows[i] : close,
-    volume: typeof volumes[i] === "number" ? volumes[i] : 0,
-  }));
-
+  const candles = makeSimCandles(config.basePrice, symbol);
+  const closes = candles.map((c) => c.close);
   const price = closes[closes.length - 1];
+  const prevClose = closes[0];
   const ema9Value = ema(closes.slice(-20), 9);
   const ema21Value = ema(closes.slice(-30), 21);
-  const vwapValue = vwapFromCandles(candles.slice(-30));
-  const prevClose =
-    typeof result?.meta?.previousClose === "number"
-      ? result.meta.previousClose
-      : closes[0];
-
+  const vwapValue = vwapFromCandles(candles);
   const movePct = roundTo(((price - prevClose) / prevClose) * 100, 2);
-  const sessionHigh = roundTo(Math.max(...closes.slice(-30)), 2);
-  const sessionLow = roundTo(Math.min(...closes.slice(-30)), 2);
+  const sessionHigh = roundTo(Math.max(...closes), 2);
+  const sessionLow = roundTo(Math.min(...closes), 2);
 
-  const sessionLogic = buildSessionLogic({
+  const logic = buildSessionLogic({
     symbol,
     price,
     ema9: ema9Value,
@@ -313,39 +212,43 @@ async function fetchYahooMarketData(symbol, sessionName) {
     prevClose: roundTo(prevClose, 2),
     movePct,
     session: sessionName,
-    signal: sessionLogic.signal,
-    bias: sessionLogic.bias,
-    note: sessionLogic.note,
-    volatility: sessionLogic.volatility,
-    preferred: sessionLogic.preferred,
-    sessionThresholds: sessionLogic.sessionThresholds,
+    signal: logic.signal,
+    bias: logic.bias,
+    note: logic.note,
+    volatility: logic.volatility,
+    preferred: logic.preferred,
     sessionHigh,
     sessionLow,
     tickSize: config.tickSize,
     tickValue: config.tickValue,
-    provider: "yahoo-chart",
+    provider: "server-sim",
     timestamp: new Date().toISOString(),
   };
 }
 
-async function getMarketData(symbol, sessionName) {
-  if (!SYMBOL_CONFIG[symbol]) return null;
-
-  try {
-    return await fetchYahooMarketData(symbol, sessionName);
-  } catch {
-    return makeSimData(symbol, sessionName);
+function recalcAccount() {
+  let openPnl = 0;
+  for (const p of positions) {
+    openPnl += Number(p.pnl || 0);
   }
+
+  demoAccount.openPnl = roundTo(openPnl, 2);
+  demoAccount.marginAvailable = roundTo(
+    Math.max(0, demoAccount.netLiquidity + demoAccount.realizedPnl + demoAccount.openPnl),
+    2
+  );
+  demoAccount.cashBalance = roundTo(demoAccount.netLiquidity + demoAccount.realizedPnl, 2);
 }
 
+// ================= ROUTES =================
 app.get("/", (_req, res) => {
   res.send("Dy Trader API is running");
 });
 
-app.get("/api/futures", async (req, res) => {
+app.get("/api/futures", (req, res) => {
   const symbol = String(req.query.symbol || "NQ").toUpperCase();
   const session = String(req.query.session || "New York");
-  const data = await getMarketData(symbol, session);
+  const data = getMarketData(symbol, session);
 
   if (!data) {
     return res.status(400).json({
@@ -357,19 +260,61 @@ app.get("/api/futures", async (req, res) => {
   res.json(data);
 });
 
-app.get("/api/scanner", async (req, res) => {
+app.get("/api/scanner", (req, res) => {
   const session = String(req.query.session || "New York");
-  const results = await Promise.all(
-    Object.keys(SYMBOL_CONFIG).map((symbol) => getMarketData(symbol, session))
-  );
-  res.json(results.filter(Boolean));
+  const results = Object.keys(SYMBOL_CONFIG).map((symbol) => getMarketData(symbol, session));
+  res.json(results);
+});
+
+app.get("/api/broker", (_req, res) => {
+  res.json(brokerState);
+});
+
+app.post("/api/broker/connect", (req, res) => {
+  const { apiKey, apiSecret, mode } = req.body || {};
+
+  brokerState.connected = true;
+  brokerState.apiKey = apiKey || "";
+  brokerState.apiSecret = apiSecret || "";
+  brokerState.mode = mode === "LIVE" ? "LIVE" : "DEMO";
+  brokerState.accountLabel =
+    brokerState.mode === "LIVE" ? "Live Account Connected" : "Demo Account Connected";
+
+  res.json({ ok: true, broker: brokerState });
+});
+
+app.post("/api/broker/disconnect", (_req, res) => {
+  brokerState.connected = false;
+  brokerState.apiKey = "";
+  brokerState.apiSecret = "";
+  brokerState.mode = "DEMO";
+  brokerState.accountLabel = "Not Connected";
+  res.json({ ok: true, broker: brokerState });
+});
+
+app.get("/api/accounts", (_req, res) => {
+  recalcAccount();
+  res.json([
+    {
+      id: demoAccount.id,
+      nickname: demoAccount.nickname,
+      netLiquidity: demoAccount.netLiquidity,
+      marginAvailable: demoAccount.marginAvailable,
+      openPnl: demoAccount.openPnl,
+      realizedPnl: demoAccount.realizedPnl,
+      cashBalance: demoAccount.cashBalance,
+      canTrade: demoAccount.canTrade,
+      permissions: demoAccount.permissions,
+      mode: brokerState.mode,
+    },
+  ]);
 });
 
 app.get("/api/orders", (_req, res) => {
   res.json(orders);
 });
 
-app.post("/api/orders", async (req, res) => {
+app.post("/api/orders", (req, res) => {
   const {
     symbol,
     side,
@@ -385,7 +330,7 @@ app.post("/api/orders", async (req, res) => {
     return res.status(400).json({ error: "Unsupported symbol" });
   }
 
-  const market = await getMarketData(symbol, session || "New York");
+  const market = getMarketData(symbol, session || "New York");
   const now = new Date().toISOString();
 
   const order = {
@@ -419,55 +364,44 @@ app.post("/api/orders", async (req, res) => {
     session: session || "New York",
   });
 
+  recalcAccount();
   res.json({ ok: true, order });
 });
 
-app.get("/api/positions", async (_req, res) => {
-  const updated = await Promise.all(
-    positions.map(async (p) => {
-      const market = await getMarketData(p.symbol, p.session || "New York");
-      const currentPrice = Number(market?.price ?? p.currentPrice);
-      const multiplier = p.side === "BUY" ? 1 : -1;
-      const pnl = roundTo((currentPrice - p.entryPrice) * p.qty * multiplier, 2);
+app.get("/api/positions", (_req, res) => {
+  const updated = positions.map((p) => {
+    const market = getMarketData(p.symbol, p.session || "New York");
+    const currentPrice = Number(market?.price ?? p.currentPrice);
+    const multiplier = p.side === "BUY" ? 1 : -1;
+    const pnl = roundTo((currentPrice - p.entryPrice) * p.qty * multiplier, 2);
 
-      return {
-        ...p,
-        currentPrice,
-        pnl,
-      };
-    })
-  );
+    return {
+      ...p,
+      currentPrice,
+      pnl,
+    };
+  });
 
   positions.length = 0;
   positions.push(...updated);
+  recalcAccount();
   res.json(updated);
 });
 
-app.get("/api/broker", (_req, res) => {
-  res.json(brokerState);
-});
+app.post("/api/positions/flatten", (req, res) => {
+  const { id } = req.body || {};
+  const idx = positions.findIndex((p) => p.id === id);
 
-app.post("/api/broker/connect", (req, res) => {
-  const { apiKey, apiSecret, mode } = req.body || {};
+  if (idx === -1) {
+    return res.status(404).json({ error: "Position not found" });
+  }
 
-  brokerState.connected = true;
-  brokerState.apiKey = apiKey || "";
-  brokerState.apiSecret = apiSecret || "";
-  brokerState.mode = mode === "LIVE" ? "LIVE" : "DEMO";
-  brokerState.accountLabel =
-    brokerState.mode === "LIVE" ? "Live Account Connected" : "Demo Account Connected";
+  const pos = positions[idx];
+  demoAccount.realizedPnl = roundTo(demoAccount.realizedPnl + Number(pos.pnl || 0), 2);
+  positions.splice(idx, 1);
+  recalcAccount();
 
-  res.json({ ok: true, broker: brokerState });
-});
-
-app.post("/api/broker/disconnect", (_req, res) => {
-  brokerState.connected = false;
-  brokerState.apiKey = "";
-  brokerState.apiSecret = "";
-  brokerState.mode = "DEMO";
-  brokerState.accountLabel = "Not Connected";
-
-  res.json({ ok: true, broker: brokerState });
+  res.json({ ok: true });
 });
 
 app.listen(PORT, () => {
