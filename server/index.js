@@ -265,21 +265,46 @@ app.get("/api/futures", (req, res) => {
 
 app.get("/api/scanner", (req, res) => {
   const session = String(req.query.session || "New York");
-  const results = Object.keys(SYMBOL_CONFIG)
-    .map((symbol) => getMarketData(symbol, session))
-    .sort((a, b) => {
-      const aScore =
-        (a.preferred ? 2 : 0) +
-        (a.signal === "BUY" || a.signal === "SELL" ? 2 : 0) +
-        (a.volatility === "High" ? 2 : a.volatility === "Normal" ? 1 : 0) +
-        Math.abs(Number(a.movePct || 0));
-      const bScore =
-        (b.preferred ? 2 : 0) +
-        (b.signal === "BUY" || b.signal === "SELL" ? 2 : 0) +
-        (b.volatility === "High" ? 2 : b.volatility === "Normal" ? 1 : 0) +
-        Math.abs(Number(b.movePct || 0));
-      return bScore - aScore;
-    });
+  const signal = String(req.query.signal || "ALL").toUpperCase();
+  const volatility = String(req.query.volatility || "ALL");
+  const preferredOnly = String(req.query.preferredOnly || "false") === "true";
+  const symbolsParam = String(req.query.symbols || "").trim();
+
+  let results = Object.keys(SYMBOL_CONFIG).map((symbol) => getMarketData(symbol, session));
+
+  if (symbolsParam) {
+    const allowed = symbolsParam
+      .split(",")
+      .map((s) => s.trim().toUpperCase())
+      .filter(Boolean);
+    results = results.filter((item) => allowed.includes(item.symbol));
+  }
+
+  if (signal !== "ALL") {
+    results = results.filter((item) => item.signal === signal);
+  }
+
+  if (volatility !== "ALL") {
+    results = results.filter((item) => item.volatility === volatility);
+  }
+
+  if (preferredOnly) {
+    results = results.filter((item) => item.preferred);
+  }
+
+  results = results.sort((a, b) => {
+    const aScore =
+      (a.preferred ? 2 : 0) +
+      (a.signal === "BUY" || a.signal === "SELL" ? 2 : 0) +
+      (a.volatility === "High" ? 2 : a.volatility === "Normal" ? 1 : 0) +
+      Math.abs(Number(a.movePct || 0));
+    const bScore =
+      (b.preferred ? 2 : 0) +
+      (b.signal === "BUY" || b.signal === "SELL" ? 2 : 0) +
+      (b.volatility === "High" ? 2 : b.volatility === "Normal" ? 1 : 0) +
+      Math.abs(Number(b.movePct || 0));
+    return bScore - aScore;
+  });
 
   res.json(results);
 });
