@@ -53,12 +53,13 @@ async function fetchFromTwelve(symbol) {
     throw new Error("Missing TWELVE_DATA_API_KEY");
   }
 
-  const map = {
-    NQ: "NQ",
-    ES: "ES",
-    CL: "CL",
-    GC: "GC"
-  };
+const map = {
+  NQ: "NQ=F",
+  ES: "ES=F",
+  CL: "CL=F",
+  GC: "GC=F",
+  BTC: "BTC-USD"
+};
 
   const twelveSymbol = map[symbol];
   if (!twelveSymbol) {
