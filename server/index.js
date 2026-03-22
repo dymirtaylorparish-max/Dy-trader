@@ -1,6 +1,6 @@
 import express from "express";
 import cors from "cors";
-import yahooFinance from "yahoo-finance2";
+import * as yahooFinance from "yahoo-finance2";
 
 const app = express();
 app.use(cors());
