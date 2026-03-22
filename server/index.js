@@ -2,19 +2,20 @@ import express from "express";
 import cors from "cors";
 
 const app = express();
-
 app.use(cors());
 
+// Test route
 app.get("/", (req, res) => {
   res.send("Dy Trader API is running");
 });
 
+// 🔥 THIS IS THE IMPORTANT ROUTE
 app.get("/api/futures", (req, res) => {
   res.json({
-    symbol: "ES",
-    price: 5200,
-    ema: 5195,
-    vwap: 5198,
+    symbol: "NASDAQ",
+    price: 18250,
+    ema: 18230,
+    vwap: 18210,
     signal: "BUY"
   });
 });
