@@ -1,6 +1,6 @@
 import express from "express";
 import cors from "cors";
-import * as yahooFinance from "yahoo-finance2";
+import yahooFinance from "yahoo-finance2";
 
 const app = express();
 app.use(cors());
@@ -26,24 +26,20 @@ app.get("/api/futures", async (req, res) => {
       return res.status(400).json({ error: "Unsupported symbol" });
     }
 
-    const result = await yahooFinance.chart(yahooSymbol, {
-      interval: "1m",
-      range: "1d"
-    });
+    const quote = await yahooFinance.quote(yahooSymbol);
 
-    const quotes = result?.quotes || [];
-    if (!quotes.length) {
-      return res.status(500).json({ error: "No market data returned" });
-    }
-
-    const latest = quotes[quotes.length - 1];
+    const price = Number(quote?.regularMarketPrice || 0);
+    const prevClose = Number(quote?.regularMarketPreviousClose || price);
+    const signal =
+      price > prevClose ? "BUY" : price < prevClose ? "SELL" : "NONE";
 
     res.json({
       symbol,
-      price: Number(latest.close || 0),
-      ema: Number(latest.close || 0),
-      vwap: Number(latest.close || 0),
-      signal: "NONE"
+      price,
+      ema: price,
+      vwap: price,
+      signal,
+      provider: "yahoo-quote"
     });
   } catch (error) {
     res.status(500).json({
