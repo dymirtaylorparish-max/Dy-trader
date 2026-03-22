@@ -55,6 +55,8 @@ const demoAccount = {
   cashBalance: 50000,
   canTrade: true,
   permissions: ["futures", "sim"],
+  dailyLossLimit: 1500,
+  riskPerTrade: 300,
 };
 
 const orders = [];
@@ -80,7 +82,8 @@ function makeSimCandles(basePrice, symbol) {
   let price = basePrice;
 
   for (let i = 0; i < 30; i += 1) {
-    const variance = symbol === "CL" ? (Math.random() - 0.5) * 0.8 : (Math.random() - 0.5) * 20;
+    const variance =
+      symbol === "CL" ? (Math.random() - 0.5) * 0.8 : (Math.random() - 0.5) * 20;
     const open = price;
     const close = roundTo(open + variance, 2);
     const high = roundTo(Math.max(open, close) + Math.abs(variance) * 0.3, 2);
@@ -262,7 +265,22 @@ app.get("/api/futures", (req, res) => {
 
 app.get("/api/scanner", (req, res) => {
   const session = String(req.query.session || "New York");
-  const results = Object.keys(SYMBOL_CONFIG).map((symbol) => getMarketData(symbol, session));
+  const results = Object.keys(SYMBOL_CONFIG)
+    .map((symbol) => getMarketData(symbol, session))
+    .sort((a, b) => {
+      const aScore =
+        (a.preferred ? 2 : 0) +
+        (a.signal === "BUY" || a.signal === "SELL" ? 2 : 0) +
+        (a.volatility === "High" ? 2 : a.volatility === "Normal" ? 1 : 0) +
+        Math.abs(Number(a.movePct || 0));
+      const bScore =
+        (b.preferred ? 2 : 0) +
+        (b.signal === "BUY" || b.signal === "SELL" ? 2 : 0) +
+        (b.volatility === "High" ? 2 : b.volatility === "Normal" ? 1 : 0) +
+        Math.abs(Number(b.movePct || 0));
+      return bScore - aScore;
+    });
+
   res.json(results);
 });
 
@@ -306,6 +324,8 @@ app.get("/api/accounts", (_req, res) => {
       canTrade: demoAccount.canTrade,
       permissions: demoAccount.permissions,
       mode: brokerState.mode,
+      dailyLossLimit: demoAccount.dailyLossLimit,
+      riskPerTrade: demoAccount.riskPerTrade,
     },
   ]);
 });
@@ -324,6 +344,10 @@ app.post("/api/orders", (req, res) => {
     stopLoss,
     takeProfit,
     session,
+    riskAmount,
+    stopTicks,
+    targetTicks,
+    rr,
   } = req.body || {};
 
   if (!SYMBOL_CONFIG[symbol]) {
@@ -342,6 +366,10 @@ app.post("/api/orders", (req, res) => {
     limitPrice: limitPrice || "",
     stopLoss: stopLoss || "",
     takeProfit: takeProfit || "",
+    riskAmount: Number(riskAmount || 0),
+    stopTicks: Number(stopTicks || 0),
+    targetTicks: Number(targetTicks || 0),
+    rr: Number(rr || 0),
     status: "FILLED",
     fillPrice: market?.price ?? "",
     timestamp: now,
