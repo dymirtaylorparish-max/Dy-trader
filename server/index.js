@@ -4,101 +4,99 @@ import cors from "cors";
 const app = express();
 app.use(cors());
 
-const TWELVE_KEY = process.env.TWELVE_DATA_API_KEY;
-
-const SYMBOL_MAP = {
-  NQ: { twelve: "NQ", yahoo: "NQ=F" },
-  ES: { twelve: "ES", yahoo: "ES=F" },
-  CL: { twelve: "CL", yahoo: "CL=F" },
-  GC: { twelve: "GC", yahoo: "GC=F" },
-  BTC: { twelve: "BTC/USD", yahoo: "BTC-USD" }
-};
-
 app.get("/", (_req, res) => {
   res.send("Dy Trader API is running");
 });
 
-async function fetchFromTwelve(symbol) {
-  const mapped = SYMBOL_MAP[symbol]?.twelve;
-  if (!mapped) throw new Error("Unsupported symbol");
-
-  if (!TWELVE_KEY) throw new Error("Missing TWELVE_DATA_API_KEY");
-
-  const url =
-    `https://api.twelvedata.com/price?symbol=${encodeURIComponent(mapped)}&apikey=${TWELVE_KEY}`;
-
-  const res = await fetch(url);
-  const json = await res.json();
-
-  if (!res.ok || json.status === "error" || !json.price) {
-    throw new Error(json.message || "Twelve Data failed");
+function calcEMA(values, period) {
+  if (!values.length) return 0;
+  const k = 2 / (period + 1);
+  let ema = values[0];
+  for (let i = 1; i < values.length; i++) {
+    ema = values[i] * k + ema * (1 - k);
   }
-
-  const price = Number(json.price);
-
-  return {
-    symbol,
-    price,
-    ema: price,
-    vwap: price,
-    signal: "NONE",
-    provider: "twelvedata"
-  };
+  return Number(ema.toFixed(2));
 }
 
-async function fetchFromYahoo(symbol) {
-  const mapped = SYMBOL_MAP[symbol]?.yahoo;
-  if (!mapped) throw new Error("Unsupported symbol");
+function calcVWAP(highs, lows, closes, volumes) {
+  let cumulativePV = 0;
+  let cumulativeVolume = 0;
 
-  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(mapped)}?interval=1m&range=1d`;
-
-  const response = await fetch(url);
-  const json = await response.json();
-
-  const result = json?.chart?.result?.[0];
-  const meta = result?.meta;
-  const quote = result?.indicators?.quote?.[0];
-
-  if (!result || !meta || !quote) {
-    throw new Error("Yahoo failed");
+  for (let i = 0; i < closes.length; i++) {
+    const typicalPrice = (highs[i] + lows[i] + closes[i]) / 3;
+    const volume = volumes[i] || 1;
+    cumulativePV += typicalPrice * volume;
+    cumulativeVolume += volume;
   }
 
-  const closes = (quote.close || []).filter((v) => typeof v === "number");
-  const latestClose =
-    closes.length > 0 ? closes[closes.length - 1] : meta.regularMarketPrice || 0;
+  if (!cumulativeVolume) return Number(closes[closes.length - 1] || 0);
+  return Number((cumulativePV / cumulativeVolume).toFixed(2));
+}
 
-  const prevClose = Number(meta.previousClose || latestClose);
-  const price = Number(latestClose || 0);
-
-  const signal =
-    price > prevClose ? "BUY" :
-    price < prevClose ? "SELL" :
-    "NONE";
-
-  return {
-    symbol,
-    price,
-    ema: price,
-    vwap: price,
-    signal,
-    provider: "yahoo"
-  };
+function buildSignal(price, ema9, ema21, vwap) {
+  if (price > ema9 && ema9 > ema21 && price > vwap) return "BUY";
+  if (price < ema9 && ema9 < ema21 && price < vwap) return "SELL";
+  return "NONE";
 }
 
 app.get("/api/futures", async (req, res) => {
   try {
     const symbol = String(req.query.symbol || "NQ").toUpperCase();
 
-    try {
-      const data = await fetchFromTwelve(symbol);
-      return res.json(data);
-    } catch (twelveError) {
-      const data = await fetchFromYahoo(symbol);
-      return res.json({
-        ...data,
-        fallbackReason: twelveError.message
+    const map = {
+      NQ: "NQ=F",
+      ES: "ES=F",
+      CL: "CL=F",
+      GC: "GC=F",
+      BTC: "BTC-USD"
+    };
+
+    const yahooSymbol = map[symbol];
+    if (!yahooSymbol) {
+      return res.status(400).json({ error: "Unsupported symbol" });
+    }
+
+    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(
+      yahooSymbol
+    )}?interval=1m&range=1d`;
+
+    const response = await fetch(url);
+    const json = await response.json();
+
+    const result = json?.chart?.result?.[0];
+    const meta = result?.meta;
+    const quote = result?.indicators?.quote?.[0];
+
+    if (!result || !meta || !quote) {
+      return res.status(500).json({
+        error: "Failed to fetch live data",
+        details: "Invalid Yahoo response"
       });
     }
+
+    const closes = (quote.close || []).filter((v) => typeof v === "number");
+    const highs = (quote.high || []).filter((v) => typeof v === "number");
+    const lows = (quote.low || []).filter((v) => typeof v === "number");
+    const volumes = (quote.volume || []).map((v) => (typeof v === "number" ? v : 1));
+
+    const latestPrice =
+      closes.length > 0 ? Number(closes[closes.length - 1].toFixed(2)) : Number(meta.regularMarketPrice || 0);
+
+    const ema9 = calcEMA(closes, 9);
+    const ema21 = calcEMA(closes, 21);
+    const vwap = calcVWAP(highs, lows, closes, volumes);
+    const signal = buildSignal(latestPrice, ema9, ema21, vwap);
+
+    return res.json({
+      symbol,
+      price: latestPrice,
+      ema: ema9,
+      ema9,
+      ema21,
+      vwap,
+      signal,
+      provider: "yahoo-chart-api"
+    });
   } catch (error) {
     return res.status(500).json({
       error: "Failed to fetch live data",
