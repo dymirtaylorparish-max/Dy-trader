@@ -21,18 +21,24 @@ const SESSION_RULES = {
     emaSpreadFactor: 0.00012,
     vwapDistanceFactor: 0.00008,
     preferredSymbols: ["GC", "CL"],
+    killZone: "19:00–22:00 ET",
+    sessionWindow: "19:00–04:00 ET",
   },
   London: {
     minMovePct: 0.12,
     emaSpreadFactor: 0.00018,
     vwapDistanceFactor: 0.00012,
     preferredSymbols: ["GC", "CL", "ES"],
+    killZone: "02:00–05:00 ET",
+    sessionWindow: "03:00–12:00 ET",
   },
   "New York": {
     minMovePct: 0.18,
     emaSpreadFactor: 0.00022,
     vwapDistanceFactor: 0.00016,
     preferredSymbols: ["NQ", "ES", "CL", "GC"],
+    killZone: "08:30–11:00 ET",
+    sessionWindow: "08:00–17:00 ET",
   },
 };
 
@@ -77,13 +83,19 @@ function ema(values, period) {
   return result;
 }
 
-function makeSimCandles(basePrice, symbol) {
+function makeSimCandles(basePrice, symbol, timeframe = "5m") {
   const candles = [];
   let price = basePrice;
 
-  for (let i = 0; i < 30; i += 1) {
+  const tfMultiplier =
+    timeframe === "1h" ? 2.6 : timeframe === "15m" ? 1.6 : 1;
+
+  for (let i = 0; i < 40; i += 1) {
     const variance =
-      symbol === "CL" ? (Math.random() - 0.5) * 0.8 : (Math.random() - 0.5) * 20;
+      symbol === "CL"
+        ? (Math.random() - 0.5) * 0.8 * tfMultiplier
+        : (Math.random() - 0.5) * 20 * tfMultiplier;
+
     const open = price;
     const close = roundTo(open + variance, 2);
     const high = roundTo(Math.max(open, close) + Math.abs(variance) * 0.3, 2);
@@ -121,6 +133,39 @@ function getVolatilityLabel(movePctAbs, sessionRule) {
   return "Low";
 }
 
+function signalFromStructure(price, ema9Value, ema21Value, vwapValue) {
+  if (ema9Value > ema21Value && price > vwapValue) return "BUY";
+  if (ema9Value < ema21Value && price < vwapValue) return "SELL";
+  return "NO TRADE";
+}
+
+function buildTimeframeData(symbol, timeframe, sessionName) {
+  const config = SYMBOL_CONFIG[symbol];
+  const candles = makeSimCandles(config.basePrice, symbol, timeframe);
+  const closes = candles.map((c) => c.close);
+  const price = closes[closes.length - 1];
+  const prevClose = closes[0];
+  const ema9Value = ema(closes.slice(-20), 9);
+  const ema21Value = ema(closes.slice(-30), 21);
+  const vwapValue = vwapFromCandles(candles);
+  const movePct = roundTo(((price - prevClose) / prevClose) * 100, 2);
+  const sessionHigh = roundTo(Math.max(...closes), 2);
+  const sessionLow = roundTo(Math.min(...closes), 2);
+
+  return {
+    timeframe,
+    price: roundTo(price, 2),
+    ema9: roundTo(ema9Value, 2),
+    ema21: roundTo(ema21Value, 2),
+    vwap: roundTo(vwapValue, 2),
+    movePct,
+    signal: signalFromStructure(price, ema9Value, ema21Value, vwapValue),
+    sessionHigh,
+    sessionLow,
+    session: sessionName,
+  };
+}
+
 function buildSessionLogic({
   symbol,
   price,
@@ -129,6 +174,7 @@ function buildSessionLogic({
   vwap,
   movePct,
   sessionName,
+  mtf,
 }) {
   const sessionRule = getSessionRule(sessionName);
   const moveAbs = Math.abs(movePct);
@@ -148,21 +194,28 @@ function buildSessionLogic({
   const enoughMove = moveAbs >= sessionRule.minMovePct;
   const enoughStructure = emaSpread >= minEmaSpread && vwapDistance >= minVwapDistance;
 
+  const tfSignals = [mtf["5m"].signal, mtf["15m"].signal, mtf["1h"].signal];
+  const buyAgreement = tfSignals.filter((s) => s === "BUY").length;
+  const sellAgreement = tfSignals.filter((s) => s === "SELL").length;
+  const agreementScore = Math.max(buyAgreement, sellAgreement);
+
   if (longTrend) bias = "Bullish";
   if (shortTrend) bias = "Bearish";
 
-  if (longTrend && enoughMove && enoughStructure) {
+  if (longTrend && enoughMove && enoughStructure && buyAgreement >= 2) {
     signal = preferred ? "BUY" : "NO TRADE";
     note =
       signal === "BUY"
-        ? `Momentum above VWAP, EMA trend bullish, and ${sessionName} thresholds passed.`
+        ? `${sessionName} long setup confirmed by ${buyAgreement}/3 timeframes.`
         : `Bullish structure exists, but ${symbol} is not a priority contract for ${sessionName}.`;
-  } else if (shortTrend && enoughMove && enoughStructure) {
+  } else if (shortTrend && enoughMove && enoughStructure && sellAgreement >= 2) {
     signal = preferred ? "SELL" : "NO TRADE";
     note =
       signal === "SELL"
-        ? `Momentum below VWAP, EMA trend bearish, and ${sessionName} thresholds passed.`
+        ? `${sessionName} short setup confirmed by ${sellAgreement}/3 timeframes.`
         : `Bearish structure exists, but ${symbol} is not a priority contract for ${sessionName}.`;
+  } else if (Math.max(buyAgreement, sellAgreement) < 2) {
+    note = `Multi-timeframe agreement is weak. Need at least 2 of 3 timeframes aligned.`;
   } else if (moveAbs < sessionRule.minMovePct) {
     note = `${sessionName} move is too small. Waiting for stronger expansion.`;
   } else if (emaSpread < minEmaSpread) {
@@ -177,6 +230,9 @@ function buildSessionLogic({
     note,
     volatility: getVolatilityLabel(moveAbs, sessionRule),
     preferred,
+    agreementScore,
+    killZone: sessionRule.killZone,
+    sessionWindow: sessionRule.sessionWindow,
   };
 }
 
@@ -184,48 +240,54 @@ function getMarketData(symbol, sessionName = "New York") {
   const config = SYMBOL_CONFIG[symbol];
   if (!config) return null;
 
-  const candles = makeSimCandles(config.basePrice, symbol);
-  const closes = candles.map((c) => c.close);
-  const price = closes[closes.length - 1];
-  const prevClose = closes[0];
-  const ema9Value = ema(closes.slice(-20), 9);
-  const ema21Value = ema(closes.slice(-30), 21);
-  const vwapValue = vwapFromCandles(candles);
-  const movePct = roundTo(((price - prevClose) / prevClose) * 100, 2);
-  const sessionHigh = roundTo(Math.max(...closes), 2);
-  const sessionLow = roundTo(Math.min(...closes), 2);
+  const tf5 = buildTimeframeData(symbol, "5m", sessionName);
+  const tf15 = buildTimeframeData(symbol, "15m", sessionName);
+  const tf1h = buildTimeframeData(symbol, "1h", sessionName);
 
   const logic = buildSessionLogic({
     symbol,
-    price,
-    ema9: ema9Value,
-    ema21: ema21Value,
-    vwap: vwapValue,
-    movePct,
+    price: tf5.price,
+    ema9: tf5.ema9,
+    ema21: tf5.ema21,
+    vwap: tf5.vwap,
+    movePct: tf5.movePct,
     sessionName,
+    mtf: {
+      "5m": tf5,
+      "15m": tf15,
+      "1h": tf1h,
+    },
   });
 
   return {
     symbol,
     displayName: config.displayName,
-    price: roundTo(price, 2),
-    ema9: roundTo(ema9Value, 2),
-    ema21: roundTo(ema21Value, 2),
-    vwap: roundTo(vwapValue, 2),
-    prevClose: roundTo(prevClose, 2),
-    movePct,
+    price: tf5.price,
+    ema9: tf5.ema9,
+    ema21: tf5.ema21,
+    vwap: tf5.vwap,
+    prevClose: roundTo(tf5.price / (1 + tf5.movePct / 100), 2),
+    movePct: tf5.movePct,
     session: sessionName,
     signal: logic.signal,
     bias: logic.bias,
     note: logic.note,
     volatility: logic.volatility,
     preferred: logic.preferred,
-    sessionHigh,
-    sessionLow,
+    sessionHigh: tf5.sessionHigh,
+    sessionLow: tf5.sessionLow,
     tickSize: config.tickSize,
     tickValue: config.tickValue,
     provider: "server-sim",
     timestamp: new Date().toISOString(),
+    agreementScore: logic.agreementScore,
+    killZone: logic.killZone,
+    sessionWindow: logic.sessionWindow,
+    mtf: {
+      "5m": tf5,
+      "15m": tf15,
+      "1h": tf1h,
+    },
   };
 }
 
@@ -294,15 +356,19 @@ app.get("/api/scanner", (req, res) => {
 
   results = results.sort((a, b) => {
     const aScore =
-      (a.preferred ? 2 : 0) +
-      (a.signal === "BUY" || a.signal === "SELL" ? 2 : 0) +
+      (a.preferred ? 3 : 0) +
+      (a.signal === "BUY" || a.signal === "SELL" ? 3 : 0) +
       (a.volatility === "High" ? 2 : a.volatility === "Normal" ? 1 : 0) +
+      Number(a.agreementScore || 0) * 2 +
       Math.abs(Number(a.movePct || 0));
+
     const bScore =
-      (b.preferred ? 2 : 0) +
-      (b.signal === "BUY" || b.signal === "SELL" ? 2 : 0) +
+      (b.preferred ? 3 : 0) +
+      (b.signal === "BUY" || b.signal === "SELL" ? 3 : 0) +
       (b.volatility === "High" ? 2 : b.volatility === "Normal" ? 1 : 0) +
+      Number(b.agreementScore || 0) * 2 +
       Math.abs(Number(b.movePct || 0));
+
     return bScore - aScore;
   });
 
