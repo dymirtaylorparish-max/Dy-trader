@@ -1,11 +1,14 @@
 import express from "express";
 import cors from "cors";
+import fs from "fs/promises";
+import path from "path";
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
 const PORT = process.env.PORT || 8080;
+const DB_PATH = path.join(process.cwd(), "server", "db.json");
 
 // ================= CONFIG =================
 const SYMBOL_CONFIG = {
@@ -42,7 +45,7 @@ const SESSION_RULES = {
   },
 };
 
-// ================= STATE =================
+// ================= IN-MEMORY STATE =================
 const brokerState = {
   connected: false,
   mode: "DEMO",
@@ -61,12 +64,44 @@ const demoAccount = {
   cashBalance: 50000,
   canTrade: true,
   permissions: ["futures", "sim"],
-  dailyLossLimit: 1500,
-  riskPerTrade: 300,
 };
 
 const orders = [];
 const positions = [];
+
+// ================= FILE DB =================
+const defaultDb = {
+  settings: {
+    riskPerTrade: 300,
+    dailyLossLimit: 1500,
+    defaultSession: "New York",
+    alertCooldownSec: 90,
+    preferredOnlyDefault: false,
+    watchlistAlertsOnly: false,
+  },
+  watchlist: ["NQ", "ES"],
+  alerts: [],
+  journal: [],
+};
+
+async function ensureDb() {
+  try {
+    await fs.access(DB_PATH);
+  } catch {
+    await fs.mkdir(path.dirname(DB_PATH), { recursive: true });
+    await fs.writeFile(DB_PATH, JSON.stringify(defaultDb, null, 2), "utf8");
+  }
+}
+
+async function readDb() {
+  await ensureDb();
+  const raw = await fs.readFile(DB_PATH, "utf8");
+  return JSON.parse(raw);
+}
+
+async function writeDb(db) {
+  await fs.writeFile(DB_PATH, JSON.stringify(db, null, 2), "utf8");
+}
 
 // ================= HELPERS =================
 function roundTo(value, decimals = 2) {
@@ -86,9 +121,7 @@ function ema(values, period) {
 function makeSimCandles(basePrice, symbol, timeframe = "5m") {
   const candles = [];
   let price = basePrice;
-
-  const tfMultiplier =
-    timeframe === "1h" ? 2.6 : timeframe === "15m" ? 1.6 : 1;
+  const tfMultiplier = timeframe === "1h" ? 2.6 : timeframe === "15m" ? 1.6 : 1;
 
   for (let i = 0; i < 40; i += 1) {
     const variance =
@@ -215,7 +248,7 @@ function buildSessionLogic({
         ? `${sessionName} short setup confirmed by ${sellAgreement}/3 timeframes.`
         : `Bearish structure exists, but ${symbol} is not a priority contract for ${sessionName}.`;
   } else if (Math.max(buyAgreement, sellAgreement) < 2) {
-    note = `Multi-timeframe agreement is weak. Need at least 2 of 3 timeframes aligned.`;
+    note = "Multi-timeframe agreement is weak. Need at least 2 of 3 timeframes aligned.";
   } else if (moveAbs < sessionRule.minMovePct) {
     note = `${sessionName} move is too small. Waiting for stronger expansion.`;
   } else if (emaSpread < minEmaSpread) {
@@ -291,7 +324,8 @@ function getMarketData(symbol, sessionName = "New York") {
   };
 }
 
-function recalcAccount() {
+async function recalcAccount() {
+  const db = await readDb();
   let openPnl = 0;
   for (const p of positions) {
     openPnl += Number(p.pnl || 0);
@@ -303,6 +337,8 @@ function recalcAccount() {
     2
   );
   demoAccount.cashBalance = roundTo(demoAccount.netLiquidity + demoAccount.realizedPnl, 2);
+  demoAccount.dailyLossLimit = Number(db.settings.dailyLossLimit || 1500);
+  demoAccount.riskPerTrade = Number(db.settings.riskPerTrade || 300);
 }
 
 // ================= ROUTES =================
@@ -401,8 +437,8 @@ app.post("/api/broker/disconnect", (_req, res) => {
   res.json({ ok: true, broker: brokerState });
 });
 
-app.get("/api/accounts", (_req, res) => {
-  recalcAccount();
+app.get("/api/accounts", async (_req, res) => {
+  await recalcAccount();
   res.json([
     {
       id: demoAccount.id,
@@ -425,7 +461,7 @@ app.get("/api/orders", (_req, res) => {
   res.json(orders);
 });
 
-app.post("/api/orders", (req, res) => {
+app.post("/api/orders", async (req, res) => {
   const {
     symbol,
     side,
@@ -483,11 +519,11 @@ app.post("/api/orders", (req, res) => {
     session: session || "New York",
   });
 
-  recalcAccount();
+  await recalcAccount();
   res.json({ ok: true, order });
 });
 
-app.get("/api/positions", (_req, res) => {
+app.get("/api/positions", async (_req, res) => {
   const updated = positions.map((p) => {
     const market = getMarketData(p.symbol, p.session || "New York");
     const currentPrice = Number(market?.price ?? p.currentPrice);
@@ -503,11 +539,11 @@ app.get("/api/positions", (_req, res) => {
 
   positions.length = 0;
   positions.push(...updated);
-  recalcAccount();
+  await recalcAccount();
   res.json(updated);
 });
 
-app.post("/api/positions/flatten", (req, res) => {
+app.post("/api/positions/flatten", async (req, res) => {
   const { id } = req.body || {};
   const idx = positions.findIndex((p) => p.id === id);
 
@@ -518,11 +554,91 @@ app.post("/api/positions/flatten", (req, res) => {
   const pos = positions[idx];
   demoAccount.realizedPnl = roundTo(demoAccount.realizedPnl + Number(pos.pnl || 0), 2);
   positions.splice(idx, 1);
-  recalcAccount();
+  await recalcAccount();
 
   res.json({ ok: true });
 });
 
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+// ================= DB ROUTES =================
+app.get("/api/settings", async (_req, res) => {
+  const db = await readDb();
+  res.json(db.settings);
+});
+
+app.put("/api/settings", async (req, res) => {
+  const db = await readDb();
+  db.settings = {
+    ...db.settings,
+    ...req.body,
+  };
+  await writeDb(db);
+  await recalcAccount();
+  res.json({ ok: true, settings: db.settings });
+});
+
+app.get("/api/watchlist", async (_req, res) => {
+  const db = await readDb();
+  res.json(db.watchlist || []);
+});
+
+app.put("/api/watchlist", async (req, res) => {
+  const db = await readDb();
+  db.watchlist = Array.isArray(req.body?.watchlist) ? req.body.watchlist : [];
+  await writeDb(db);
+  res.json({ ok: true, watchlist: db.watchlist });
+});
+
+app.get("/api/alerts", async (_req, res) => {
+  const db = await readDb();
+  res.json(db.alerts || []);
+});
+
+app.post("/api/alerts", async (req, res) => {
+  const db = await readDb();
+  const alert = {
+    id: `alert_${Date.now()}`,
+    message: String(req.body?.message || ""),
+    createdAt: new Date().toISOString(),
+  };
+  db.alerts = [alert, ...(db.alerts || [])].slice(0, 100);
+  await writeDb(db);
+  res.json({ ok: true, alert });
+});
+
+app.delete("/api/alerts", async (_req, res) => {
+  const db = await readDb();
+  db.alerts = [];
+  await writeDb(db);
+  res.json({ ok: true });
+});
+
+app.get("/api/journal", async (_req, res) => {
+  const db = await readDb();
+  res.json(db.journal || []);
+});
+
+app.post("/api/journal", async (req, res) => {
+  const db = await readDb();
+  const entry = {
+    id: `jrnl_${Date.now()}`,
+    createdAt: new Date().toISOString(),
+    symbol: String(req.body?.symbol || ""),
+    side: String(req.body?.side || ""),
+    setupType: String(req.body?.setupType || ""),
+    entry: String(req.body?.entry || ""),
+    exit: String(req.body?.exit || ""),
+    pnl: String(req.body?.pnl || ""),
+    lesson: String(req.body?.lesson || ""),
+    screenshot: String(req.body?.screenshot || ""),
+  };
+  db.journal = [entry, ...(db.journal || [])];
+  await writeDb(db);
+  res.json({ ok: true, entry });
+});
+
+// ================= START =================
+ensureDb().then(() => {
+  app.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+  });
 });
